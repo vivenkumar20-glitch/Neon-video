@@ -20,6 +20,7 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from multiprocessing import get_context
 from typing import Dict, List, Tuple
 
 import cv2
@@ -98,6 +99,7 @@ def render_single_shot_worker(args: Tuple[int, int, int, str, str, int, bool]) -
     spec = SHOT_SPECS[shot_num - 1]
     t0 = time.perf_counter()
 
+    cv2.setNumThreads(1)
     renderer = RENDERER_CLASSES[shot_num](w, h)
     t_init = time.perf_counter() - t0
 
@@ -109,14 +111,16 @@ def render_single_shot_worker(args: Tuple[int, int, int, str, str, int, bool]) -
         del r10
 
     os.makedirs(os.path.dirname(os.path.abspath(clip_path)), exist_ok=True)
+    temp_clip_path = os.path.splitext(clip_path)[0] + ".partial.mp4"
     ff_cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        "ffmpeg", "-y", "-loglevel", "error", "-filter_threads", "1",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", f"{w}x{h}", "-r", str(FPS),
         "-i", "pipe:0",
         "-c:v", "libx264", "-preset", "fast", "-crf", str(crf),
-        "-pix_fmt", "yuv420p",
-        clip_path,
+        "-pix_fmt", "yuv420p", "-threads", "1",
+        "-video_track_timescale", "24000",
+        temp_clip_path,
     ]
     proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE)
 
@@ -129,40 +133,41 @@ def render_single_shot_worker(args: Tuple[int, int, int, str, str, int, bool]) -
     adj_diffs = []
     t_render_start = time.perf_counter()
 
-    assert proc.stdin is not None
-    for local_f in range(n_frames):
-        global_f = spec.start_f + local_f
-        lin_rgb, profile = renderer.render(local_f, global_f)
-        if shot10_tail is not None and local_f < 16:
-            diss = smoothstep(local_f / 15.0)
-            lin_rgb = shot10_tail * (1.0 - diss) + lin_rgb * diss
+    with proc:
+        assert proc.stdin is not None
+        for local_f in range(n_frames):
+            global_f = spec.start_f + local_f
+            lin_rgb, profile = renderer.render(local_f, global_f)
+            if shot10_tail is not None and local_f < 16:
+                diss = smoothstep(local_f / 15.0)
+                lin_rgb = shot10_tail * (1.0 - diss) + lin_rgb * diss
 
-        rgb_u8 = finish_35mm(lin_rgb, global_f, profile)
-        proc.stdin.write(rgb_u8.tobytes())
+            rgb_u8 = finish_35mm(lin_rgb, global_f, profile)
+            proc.stdin.write(rgb_u8.tobytes())
 
-        # Temporal QC: measure adjacent frame MAE on a 1/4-res downsample to catch unexpected flicker
-        if local_f % 4 == 0 or local_f % 4 == 1:
-            small = cv2.resize(rgb_u8, (w // 4, h // 4), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-            if local_f % 4 == 1 and prev_frame_f32 is not None:
-                adj_diffs.append(float(np.mean(np.abs(small - prev_frame_f32))))
-            prev_frame_f32 = small
+            # Temporal QC: measure adjacent frame MAE on a 1/4-res downsample to catch unexpected flicker
+            if local_f % 4 == 0 or local_f % 4 == 1:
+                small = cv2.resize(rgb_u8, (w // 4, h // 4), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+                if local_f % 4 == 1 and prev_frame_f32 is not None:
+                    adj_diffs.append(float(np.mean(np.abs(small - prev_frame_f32))))
+                prev_frame_f32 = small
 
-        if export_diagnostics and local_f in sample_locals:
-            tag = sample_locals[local_f]
-            _save_rgb(os.path.join(diag_dir, "samples", f"shot_{shot_num:02d}_{tag}_f{global_f:04d}.png"), rgb_u8)
-            if local_f == spec.hero_local_f and w >= 1920:
-                for clabel, cx_f, cy_f in spec.crop_centers:
-                    _export_crop(
-                        rgb_u8, cx_f, cy_f,
-                        os.path.join(diag_dir, "crops", f"shot_{shot_num:02d}_{clabel}_600x450.png"),
-                        600, 450,
-                    )
-
-    proc.stdin.close()
-    ret = proc.wait()
+            if export_diagnostics and local_f in sample_locals:
+                tag = sample_locals[local_f]
+                _save_rgb(os.path.join(diag_dir, "samples", f"shot_{shot_num:02d}_{tag}_f{global_f:04d}.png"), rgb_u8)
+                if local_f == spec.hero_local_f and w >= 1920:
+                    for clabel, cx_f, cy_f in spec.crop_centers:
+                        _export_crop(
+                            rgb_u8, cx_f, cy_f,
+                            os.path.join(diag_dir, "crops", f"shot_{shot_num:02d}_{clabel}_600x450.png"),
+                            600, 450,
+                        )
+        proc.stdin.close()
+        ret = proc.wait()
     if ret != 0:
         raise RuntimeError(f"FFmpeg failed encoding shot {shot_num} (exit {ret})")
 
+    os.replace(temp_clip_path, clip_path)
     t_render = time.perf_counter() - t_render_start
     return {
         "shot": shot_num,
@@ -176,12 +181,15 @@ def render_single_shot_worker(args: Tuple[int, int, int, str, str, int, bool]) -
     }
 
 
-def concat_and_mux(shot_clips: List[str], audio_wav: str, out_mp4: str, crf: int = 16) -> None:
+def concat_and_mux(shot_clips: List[str], audio_wav: str, out_mp4: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(out_mp4)), exist_ok=True)
     list_file = os.path.join(os.path.dirname(os.path.abspath(shot_clips[0])), "concat_list.txt")
     with open(list_file, "w", encoding="utf-8") as f:
-        for p in shot_clips:
-            f.write(f"file '{os.path.abspath(p)}'\n")
+        for clip, spec in zip(shot_clips, SHOT_SPECS, strict=True):
+            path = os.path.abspath(clip).replace("'", "'\\''")
+            duration = (spec.end_f - spec.start_f) / FPS
+            f.write(f"file '{path}'\n")
+            f.write(f"duration {duration:.9f}\n")
 
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
@@ -190,7 +198,6 @@ def concat_and_mux(shot_clips: List[str], audio_wav: str, out_mp4: str, crf: int
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart",
-        "-shortest",
         out_mp4,
     ]
     subprocess.run(cmd, check=True)
@@ -304,7 +311,7 @@ def run_animatic(root: str) -> None:
         clips.append(cpath)
         tasks.append((spec.shot_num, 512, 288, cpath, diag, 22, False))
     t0 = time.perf_counter()
-    with ProcessPoolExecutor(max_workers=2) as ex:
+    with ProcessPoolExecutor(max_workers=2, mp_context=get_context("spawn")) as ex:
         for res in ex.map(render_single_shot_worker, tasks):
             print(f"  Animatic Shot {res['shot']:02d} ({res['title']}): {res['render_sec']}s")
     out_anim = os.path.join(diag, "animatic_512x288.mp4")
@@ -339,7 +346,7 @@ def run_full_render(root: str, workers: int = 2, crf: int = 16, force: bool = Fa
     shot_metrics: List[Dict] = []
     if tasks:
         print(f"Rendering {len(tasks)} shots at 2048x1152 (24 fps, CRF {crf}) with {workers} parallel workers...")
-        with ProcessPoolExecutor(max_workers=workers) as ex:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn")) as ex:
             futs = {ex.submit(render_single_shot_worker, t): t[0] for t in tasks}
             for fut in as_completed(futs):
                 res = fut.result()
@@ -353,7 +360,7 @@ def run_full_render(root: str, workers: int = 2, crf: int = 16, force: bool = Fa
 
     master_mp4 = os.path.join(root, "newton_the_hidden_order.mp4")
     print("Concatenating shots & muxing 48 kHz AAC master MP4...")
-    concat_and_mux(clips, wav, master_mp4, crf=crf)
+    concat_and_mux(clips, wav, master_mp4)
 
     # Copy to /public/newton_the_hidden_order.mp4 for the live Vite web cinema player
     public_mp4 = os.path.join(root, "public", "newton_the_hidden_order.mp4")

@@ -1,17 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+const filmUrl = `${import.meta.env.BASE_URL}newton_the_hidden_order.mp4`;
+
 export default function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
 
   const togglePlayback = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
     if (video.paused || video.ended) {
+      setPlaybackError(null);
+      if (video.error) video.load();
       if (video.ended) {
         video.currentTime = 0;
       }
-      video.play().catch(() => {});
+      video.play().catch((error: DOMException) => {
+        if (error.name !== 'AbortError') {
+          setPlaybackError('The film could not be played. Try again.');
+        }
+      });
     } else {
       video.pause();
     }
@@ -19,7 +28,7 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.code === 'Space') {
+      if (event.code === 'Space' && !event.repeat && !(event.target instanceof HTMLButtonElement)) {
         event.preventDefault();
         togglePlayback();
       }
@@ -36,14 +45,30 @@ export default function App() {
       >
         <video
           ref={videoRef}
-          src="/newton_the_hidden_order.mp4"
+          src={filmUrl}
           playsInline
           preload="auto"
           className="w-full h-full object-contain bg-black block"
-          onPlay={() => setIsPlaying(true)}
+          onPlaying={() => {
+            setIsPlaying(true);
+            setPlaybackError(null);
+          }}
           onPause={() => setIsPlaying(false)}
           onEnded={() => setIsPlaying(false)}
+          onError={() => {
+            setIsPlaying(false);
+            setPlaybackError('The film could not be loaded. Try again.');
+          }}
         />
+
+        {playbackError && (
+          <p role="status" className="absolute inset-x-4 bottom-4 text-center text-sm text-white/80">
+            {playbackError}{' '}
+            <a href={filmUrl} download onClick={(event) => event.stopPropagation()} className="underline">
+              Download MP4
+            </a>
+          </p>
+        )}
 
         {!isPlaying && (
           <button
